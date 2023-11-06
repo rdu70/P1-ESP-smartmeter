@@ -26,8 +26,11 @@ PubSubClient mqtt_client(espClient);
 WiFiClient cli_client;
 WiFiServer cli_server(23);
 
-// Some constants
-#define MAX_REMOTE 40     // Maximum number of remote
+WiFiClient p1_client;
+WiFiServer p1_server(101);
+WiFiClient pm1_client;
+WiFiServer pm1_server(102);
+
 #define MQTT_TOPIC "home/smartmeter/"
 #define MQTT_TOPIC_SUB "home/smartmeter/cmd/#"
 #define MQTT_LWT "home/smartmeter/availability"
@@ -38,42 +41,15 @@ int tx_pin = D1;  // D1
 int rx_led = D3;
 int tx_led = D4;
 
-// Timing
-// #define FREQ 433.92
-
-// Receiving vars
-#define max_frame_bit 80
-volatile bool rx_frame_buffer[max_frame_bit + 1];
-volatile uint8_t rx_frame_received[(max_frame_bit / 8) + 1];
-volatile bool rx_done = false;
-volatile uint8_t rx_bit_cnt = 0;
-volatile uint8_t rx_preamble_cnt = 0;
-volatile uint8_t rx_state = 0;
-volatile bool rx_skip_next_edge = false;
-volatile bool rx_in_frame = false;
-volatile bool rx_last_bit = false;
-volatile unsigned long rx_last_uS = 0;
-volatile unsigned long rx_current_uS = 0;
-volatile unsigned long rx_elapsed_uS = 0;
-
-// Transmitting vars
-volatile uint8_t tx_frame_tosend[(max_frame_bit / 8) + 1];
-volatile bool tx_frame_buffer[max_frame_bit];
-volatile bool tx_start = false;
-volatile bool tx_done = true;
-volatile bool tx_protocol = 1;
-volatile bool tx_newtiming = false;
-volatile uint8_t tx_state = 0;
-volatile uint8_t tx_preamb = 0;
-volatile uint8_t tx_bit_tosend = 56;
-volatile uint8_t tx_bit_cnt = 0;
-volatile bool tx_next_bit = 0;
-volatile uint8_t tx_repeat = 0;
-volatile bool tx_cc1101mode = false;
 
 // cli vars
 std::string line = "";
 std::string dbgdsp = "";
+bool cli_dspOrigP1 = false;
+bool cli_dspModP1 = false;
+bool cli_dspEnergy = false;
+bool cli_dspPower = false;
+bool cli_dspPeak = false;
 
 // netcli vars
 bool netcli_connected = false;
@@ -82,20 +58,22 @@ bool netcli_disconnect = false;
 // Network vars
 bool wifi_connected = false;
 bool mqtt_connected = false;
+bool p1_connected = false;
+bool pm1_connected = false;
 uint8_t eeprom_to_save = 0;
 uint8_t cmd_clear = 255;
 
-// Remote control storage
-struct RC {
-  uint8_t protocol = 1;  // default EV protocol
-  uint64_t id = 0;
-  bool updated = false;
+
+struct CFG {
+  uint32_t I_Max_meter = 32;
+  uint32_t I_Max_station = 32;
+  //bool Show_Orig_P1 = false;
+  //bool Show_Mod_P1 = false;
+  //bool Show_Stats = false;
 };
 
-RC rc[MAX_REMOTE];
-RC rx_rc;
-RC tx_rc;
-RC tmp_rc;
+CFG cfg;
+CFG cfg_old;
 
 struct DG {
   bool received = false;
@@ -115,6 +93,7 @@ struct DG {
   uint32_t E_injected = 0;
   uint32_t P_consumed = 0;
   uint32_t P_injected = 0;
+  uint32_t P_max = 0;
   uint32_t P=0;
   uint32_t U_L1 = 0;
   uint32_t U_L2 = 0;
@@ -122,6 +101,9 @@ struct DG {
   uint32_t I_L1 = 0;
   uint32_t I_L2 = 0;
   uint32_t I_L3 = 0;
+  uint32_t I_Mod_L1 = 0;
+  uint32_t I_Mod_L2 = 0;
+  uint32_t I_Mod_L3 = 0;
   uint32_t P_act_L1 = 0;
   uint32_t P_act_L2 = 0;
   uint32_t P_act_L3 = 0;
@@ -131,7 +113,17 @@ struct DG {
   uint32_t P_cos_L1 = 0;
   uint32_t P_cos_L2 = 0;
   uint32_t P_cos_L3 = 0;
+  uint32_t P_Mod_act_L1 = 0;
+  uint32_t P_Mod_act_L2 = 0;
+  uint32_t P_Mod_act_L3 = 0;
+  uint32_t CurrentPeak = 0;
+  uint32_t LastPeak = 0;
+  uint32_t CurrentDate = 0;
+  uint32_t CurrentTime = 0;
+  uint32_t QuarterTime = 0;
   char buf[2048];
+  char OrigP1[2048];
+  char ModP1[2048];
 };
 
 DG dg;
@@ -142,8 +134,10 @@ unsigned long currentmillis = millis();
 unsigned long lastmillis = currentmillis;
 uint32_t uptime = 0;
 uint8_t loopidx = 0;
-int safecnt = 20;
+int safecnt = 20;  // Time before start to allow OTA
 char uptime_txt[48];
+char dttime_txt[48];
+bool p1_serial_out = false;
 
 
 
@@ -159,7 +153,6 @@ void cli_print(String msg, bool ln = false, bool sercli=true, bool netcli=true)
 }
 
 
-
 std::string trim(const std::string& str,
                  const std::string& whitespace = " \t")
 {
@@ -173,21 +166,32 @@ std::string trim(const std::string& str,
     return str.substr(strBegin, strRange);
 }
 
+void check_cfg() {
+  if ((cfg.I_Max_meter < 0) || (cfg.I_Max_meter > 32)) cfg.I_Max_meter = 32;
+  if ((cfg.I_Max_station < 0) || (cfg.I_Max_station > 32)) cfg.I_Max_station = 32;
+}
+
+void print_cfg() {
+  cli_print(String("Meter max current    : ") + cfg.I_Max_meter, true, false, true);
+  cli_print(String("Station max current  : ") + cfg.I_Max_station, true, false, true);
+}
 
 void data_save() {
-  for (uint8_t idx = 0; idx < MAX_REMOTE; idx++) { rc[idx].updated = false; EEPROM.put(idx*50, rc[idx]); }
-  EEPROM.put(2000, rx_rc);
-  EEPROM.put(2100, tx_rc);
+  check_cfg();
+  EEPROM.put(0, cfg);
   EEPROM.commit();
+  memcpy(&cfg_old, &cfg, sizeof(cfg));
   dbgdsp = "Data saved";
 }
 
 void data_load() {
-  for (uint8_t idx = 0; idx < MAX_REMOTE; idx++) EEPROM.get(idx*50, rc[idx]);
-  EEPROM.get(2000, rx_rc);
-  EEPROM.get(2100, tx_rc);
+  EEPROM.get(0, cfg);
+  check_cfg();
+  memcpy(&cfg_old, &cfg, sizeof(cfg));
   dbgdsp = "Data loaded";
+  print_cfg();
 }
+
 
 void uptime_to_text(char const *header, char const *trailer) {
   int d = uptime/86400;
@@ -230,23 +234,37 @@ void exec_cmd(bool ser = false, bool net = false) {
   try { p2 = std::stoi(param2, nullptr, 0); } catch(...) {}
   try { p3 = std::stoi(param3, nullptr, 0); } catch(...) {}
  
+  cli_print(cmd.c_str());
+
   if ((cmd == "show") || (cmd == "sh")) {
-    bool found = false;
+    //bool found = false;
     if (param1 == "uptime") {
-      uptime_to_text("Uptime         : ", "");
+      uptime_to_text("\n\rUptime         : ", "\n\r");
       cli_print(uptime_txt, true, ser, net);
     }
-  }
-  if ((cmd == "copy") || (cmd == "cp")) {
-    if ((p1 >= 0) && (p1 < MAX_REMOTE)) tmp_rc = rc[p1];
-    else if (param1 == "rx") tmp_rc = rx_rc;
-    else if (param1 == "tx") tmp_rc = tx_rc;
-    if ((p2 >= 0) && (p2 < MAX_REMOTE)) rc[p2] = tmp_rc;
-    else if (param2 == "rx") rx_rc = tmp_rc;
-    else if (param2 == "tx") tx_rc = tmp_rc;
+    if (param1 == "p1") {
+      cli_dspOrigP1 = !cli_dspOrigP1;
+    }
+    if (param1 == "m1") {
+      cli_dspModP1 = !cli_dspModP1;
+    }
+    if (param1 == "power") {
+      cli_dspPower = !cli_dspPower;
+    }
+    if (param1 == "energy") {
+      cli_dspEnergy = !cli_dspEnergy;
+    }
+    if (param1 == "peak") {
+      cli_dspPeak = !cli_dspPeak;
+    }
+    if (param1 == "config") {
+      print_cfg();
+    }
   }
   if (cmd == "save") data_save();
   if (cmd == "load") data_load();
+  if (cmd == "serialon") p1_serial_out = true;
+  if (cmd == "serialoff") p1_serial_out = false;
 }
 
 void process_cli(bool ser=false, bool net=false) {
@@ -350,8 +368,13 @@ void process_mqtt() {
           sprintf(value, "%i", dg.E_injected);
           mqtt_client.publish(topic, value, true);
         }
+        if (dg.LastPeak != dg_old.LastPeak){
+          sprintf(topic, "%s%s", MQTT_TOPIC, "P_QuarterHourPeak");
+          sprintf(value, "%i", dg.LastPeak);
+          mqtt_client.publish(topic, value, true);
+        }
         dg.sent = true;
-        dg_old = dg;
+        memcpy(&dg_old, &dg, sizeof(dg));
     }
   }
 }
@@ -381,9 +404,25 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
   dbgdsp = "Message arrived [" + std::string(topic) + "] " + std::string(value);
 
   strremove(topic, MQTT_TOPIC);
-  int id = 0;
-  try { id = std::stoi(topic, nullptr, 0); } catch(...) {}
+  //int id = 0;
+  //try { id = std::stoi(topic, nullptr, 0); } catch(...) {}
 
+  payload[length] = 0;
+
+/*  if (String(topic) == "cmd/mode") {
+    if (String((char *) payload) == "transparent") {
+      dbgdsp += " - Transparent mode ON";
+    }
+    if (String((char *)payload) == "") {
+    }
+  }
+*/
+  if (String(topic) == "cmd/maxamp") {
+    int amp = 0;
+    try { amp = std::stoi((char *)payload, nullptr, 0); } catch(...) {}
+    dbgdsp += " - Set MAX amp to " + std::to_string(amp) + " A";
+    cfg.I_Max_station = amp;
+  }
 }
 
 void crc_compute(DG *dg) {
@@ -400,17 +439,81 @@ void crc_compute(DG *dg) {
       bit++;
     }
   } 
-  }else { cli_client.write('E');}
+  }else { /*cli_client.write('E');*/}
   sprintf(dg->crc_computed, "%04X", crc);
 }
 
-uint32_t dg_decode_obis(char *code, char *unit) {
+void crc_add(char *buf) {
+  unsigned int crc = 0;
+  unsigned int idx = 0;
+  int16_t l = strlen(buf); 
+  for (unsigned int i = 0; i < l; i++) {
+    crc ^= (unsigned int)(buf[i]);
+    int bit = 0;
+    while (bit < 8) {
+      if ((crc & 1) != 0) {
+        crc = (crc >> 1) ^ 0xA001;
+      }
+      else crc >>= 1;
+      bit++;
+    }
+    idx = i;
+  }
+  sprintf(&buf[idx+1], "%04X\n\r", crc);
+  buf[idx+7] = '\0';
+}
+
+void p1_copytoorig(DG *dg) {
+  if (dg->idx > 10) {
+    for (unsigned int i = 0; i < dg->idx; i++) {
+      dg->OrigP1[i] = dg->buf[i];
+      dg->OrigP1[i+1] = '\0';
+    }
+  }
+}
+
+void p1_copytomod(DG *dg) {
+  if (dg->idx > 10) {
+    for (unsigned int i = 0; i < dg->idx-6; i++) {
+      dg->ModP1[i] = dg->buf[i];
+      dg->ModP1[i+1] = '\0';
+    }
+  }
+}
+
+uint32_t dg_obis_getdate() {
+  char* code = "0-0:1.0.0(";
+  char data[7];
+  int idx = strstr(dg.buf, code) - dg.buf;
+      if (idx > 0){
+        memcpy(data, dg.buf + idx + strlen(code), 6);
+        data[6]=0;
+        uint32_t val = 0;
+          try { val = std::stoi(data, nullptr, 10); } catch(...) {}
+          return val;
+      } else return 0;
+}
+
+uint32_t dg_obis_gettime() {
+  char* code = "0-0:1.0.0(";
+  char data[7];
+  int idx = strstr(dg.buf, code) - dg.buf;
+      if (idx > 0){
+        memcpy(data, dg.buf + idx + strlen(code) + 6, 6);
+        data[6]=0;
+        uint32_t val = 0;
+          try { val = std::stoi(data, nullptr, 10); } catch(...) {}
+          return val;
+      } else return 0;
+}
+
+uint32_t dg_obis_decode(char *code, char *unit) {
+  //char st[100];
   int idx = strstr(dg.buf, code) - dg.buf;
       if (idx > 0){
         idx += strlen(code);
         int idx2 = strstr(dg.buf + idx, unit) - dg.buf - idx;
-        char st[100];
-        if (idx2 > 0) {
+        if ((idx2 > 0) && (idx2 < 100)) {
           char sub[100];
           strncpy(sub, dg.buf+idx, idx2); sub[idx2]='\0';
           int idxComma = strstr(sub, ".") - sub; if (idxComma>0) memmove(&sub[idxComma], &sub[idxComma + 1], strlen(sub) - idxComma);
@@ -421,13 +524,31 @@ uint32_t dg_decode_obis(char *code, char *unit) {
         } else return 0;
       } else return 0;
 }
+
+bool dg_obis_update(char *code, char *unit, uint32_t value, uint8_t int_len, uint8_t dec_len) {
+  uint32_t dec = 1;
+  for (unsigned int i = 0; i < dec_len; i++) dec *= 10;
+  int idx = strstr(dg.ModP1, code) - dg.ModP1;
+      if ((idx > 0) && (int_len < 10) && (dec_len < 4)) {
+        idx += strlen(code);
+        int idx2 = strstr(dg.ModP1 + idx, unit) - dg.ModP1 - idx;
+        if (idx2 > 0) {
+          char fmt[5];
+          char val[10];
+          sprintf(fmt, "%%%02ii", int_len);
+          sprintf(val, fmt, value / dec);
+          memcpy(dg.ModP1+idx, val, int_len);
+          sprintf(fmt, "%%%02ii", dec_len);
+          sprintf(val, fmt, value % dec);
+          memcpy(dg.ModP1+idx+int_len+1, val, dec_len);
+          return true;
+        } else return false;
+      } else return false;
+}
+
 void setup() {
   // Init serial port
   Serial.begin(115200);  
-  Serial.print("\nP1 Smart controller\n");
-
-
-  Serial.print("> ");
 
   EEPROM.begin(4096);
   data_load();
@@ -477,6 +598,10 @@ void loop() {
         mqtt_client.setCallback(mqtt_callback);
         // start telnet server
         cli_server.begin();
+        // start P1 server
+        p1_server.begin();
+        // start P1 Mod server
+        pm1_server.begin();
       }
     }
     else {
@@ -501,10 +626,7 @@ void loop() {
     }
 
     // data management
-    bool updated = false;
-    for (uint8_t idx = 0; idx < MAX_REMOTE; idx++) {
-      if (rc[idx].updated) updated = true;
-    }
+    bool updated = (memcmp(&cfg, &cfg_old, sizeof(cfg)) != 0);
     if (updated) {
       if (eeprom_to_save <= 0) data_save(); else eeprom_to_save--;
     } else eeprom_to_save = 60;
@@ -521,8 +643,11 @@ void loop() {
   case 0:  // Process OTA
     OTAhandle();
     break;
-  case 1:  // Process telnet client
-    if (!netcli_connected) cli_client = cli_server.available();
+
+  case 1:  // Process telnet clients
+
+    // Management client
+    if (!netcli_connected) { cli_client = cli_server.available(); }
     if (cli_client) {
       if (cli_client.connected())
         if (netcli_disconnect == true) {
@@ -547,12 +672,46 @@ void loop() {
       netcli_connected = false;
       dbgdsp = "Network client lost";
     }
+
+    // P1 Client cnx
+    if (!p1_connected) p1_client = p1_server.available();
+    if (p1_client) {
+      if (!p1_connected && p1_client.connected()) {
+          p1_connected = true;
+          dbgdsp = "P1 client connected";
+      }
+      if (p1_connected && !p1_client.connected()) {
+        p1_connected = false;
+        dbgdsp = "P1 client disconnected";
+      }
+    } else if (p1_connected) {
+      p1_connected = false;
+      dbgdsp = "P1 client lost";
+    }
+
+    // P1 Mod client cnx
+    if (!pm1_connected) pm1_client = pm1_server.available();
+    if (pm1_client) {
+      if (!pm1_connected && pm1_client.connected()) {
+          pm1_connected = true;
+          dbgdsp = "P1 Mod client connected";
+      }
+      if (pm1_connected && !pm1_client.connected()) {
+        pm1_connected = false;
+        dbgdsp = "P1 Mod client disconnected";
+      }
+    } else if (pm1_connected) {
+      pm1_connected = false;
+      dbgdsp = "P1 Mod client lost";
+    }
+
     break;
-  case 2: // Process RX
+
+  case 2: // Process Serial RX (Incoming P1 port)
     if (safecnt == 0) {
       while ((max_read-- > 0) && Serial.available()) {
           ch = Serial.read();
-          //cli_client.write(ch);
+          //cli_client.write(ch);  // debug
           if (ch == '/') {
             dg.idx=0;
             dg.buf[dg.idx++]=ch;
@@ -580,47 +739,113 @@ void loop() {
       }
     }
     break;
-  case 3:
-    // process dg
+
+  case 3:  // process received datagram
     if (dg.received && dg.crc_valid) {
-      dg.P_consumed = dg_decode_obis("1-0:1.7.0(", "*kW)");
-      dg.P_injected = dg_decode_obis("1-0:2.7.0(", "*kW)");
+      dg.P_consumed = dg_obis_decode("1-0:1.7.0(", "*kW)");
+      dg.P_injected = dg_obis_decode("1-0:2.7.0(", "*kW)");
       dg.P = dg.P_consumed - dg.P_injected;
-      dg.E_consumed_1 = dg_decode_obis("1-0:1.8.1(", "*kWh)");
-      dg.E_consumed_2 = dg_decode_obis("1-0:1.8.2(", "*kWh)");
+      dg.E_consumed_1 = dg_obis_decode("1-0:1.8.1(", "*kWh)");
+      dg.E_consumed_2 = dg_obis_decode("1-0:1.8.2(", "*kWh)");
       dg.E_consumed =  dg.E_consumed_1 + dg.E_consumed_2;
-      dg.E_injected_1 = dg_decode_obis("1-0:2.8.1(", "*kWh)");
-      dg.E_injected_2 = dg_decode_obis("1-0:2.8.2(", "*kWh)");
+      dg.E_injected_1 = dg_obis_decode("1-0:2.8.1(", "*kWh)");
+      dg.E_injected_2 = dg_obis_decode("1-0:2.8.2(", "*kWh)");
       dg.E_injected = dg.E_injected_1 + dg.E_injected_2;
-      dg.U_L1 = dg_decode_obis("1-0:32.7.0(", "*V)");
-      dg.U_L2 = dg_decode_obis("1-0:52.7.0(", "*V)");
-      dg.U_L3 = dg_decode_obis("1-0:72.7.0(", "*V)");
-      dg.I_L1 = dg_decode_obis("1-0:31.7.0(", "*A)");
-      dg.I_L2 = dg_decode_obis("1-0:51.7.0(", "*A)");
-      dg.I_L3 = dg_decode_obis("1-0:71.7.0(", "*A)");
-      dg.P_act_L1 = dg_decode_obis("1-0:21.7.0(", "*kW)") - dg_decode_obis("1-0:22.7.0(", "*kW)");
-      dg.P_act_L2 = dg_decode_obis("1-0:41.7.0(", "*kW)") - dg_decode_obis("1-0:42.7.0(", "*kW)");
-      dg.P_act_L3 = dg_decode_obis("1-0:61.7.0(", "*kW)") - dg_decode_obis("1-0:62.7.0(", "*kW)");
+
+      dg.CurrentDate = dg_obis_getdate();
+      dg.CurrentTime = dg_obis_gettime();
+      dg.QuarterTime = dg.CurrentTime % 100 + 60 * (((dg.CurrentTime / 100) % 100) % 15);
+      dg.CurrentPeak = dg_obis_decode("1-0:1.4.0(", "*kW)");
+      if (dg.QuarterTime > 0) dg.CurrentPeak = dg.CurrentPeak * 900 / dg.QuarterTime;
+      if (dg.QuarterTime < dg_old.QuarterTime) dg.LastPeak = dg_old.CurrentPeak;
+
+      dg.U_L1 = dg_obis_decode("1-0:32.7.0(", "*V)");
+      dg.U_L2 = dg_obis_decode("1-0:52.7.0(", "*V)");
+      dg.U_L3 = dg_obis_decode("1-0:72.7.0(", "*V)");
+      dg.I_L1 = dg_obis_decode("1-0:31.7.0(", "*A)");
+      dg.I_L2 = dg_obis_decode("1-0:51.7.0(", "*A)");
+      dg.I_L3 = dg_obis_decode("1-0:71.7.0(", "*A)");
+      dg.P_act_L1 = dg_obis_decode("1-0:21.7.0(", "*kW)") - dg_obis_decode("1-0:22.7.0(", "*kW)");
+      dg.P_act_L2 = dg_obis_decode("1-0:41.7.0(", "*kW)") - dg_obis_decode("1-0:42.7.0(", "*kW)");
+      dg.P_act_L3 = dg_obis_decode("1-0:61.7.0(", "*kW)") - dg_obis_decode("1-0:62.7.0(", "*kW)");
       dg.P_ap_L1 = dg.U_L1 * dg.I_L1;
       dg.P_ap_L2 = dg.U_L2 * dg.I_L2;
       dg.P_ap_L3 = dg.U_L3 * dg.I_L3;
       dg.P_cos_L1 = (dg.P_act_L1 != 0 ? (100 * dg.P_ap_L1 / dg.P_act_L1) : 1);
       dg.P_cos_L2 = (dg.P_act_L2 != 0 ? (100 * dg.P_ap_L2 / dg.P_act_L2) : 1);
       dg.P_cos_L3 = (dg.P_act_L3 != 0 ? (100 * dg.P_ap_L3 / dg.P_act_L3) : 1);
-      char st[200];
-      sprintf(st, "\n\rP_Cons:%7i\n\rP_Inj :%7i\n\rE_Cons:%9i (%i + %i)\n\rE_Inj :%9i (%i + %i)\n\rU     : %3i %3i %3i\n\rI      : %3i %3i %3i",
-                  dg.P_consumed, dg.P_injected, dg.E_consumed, dg.E_consumed_1, dg.E_consumed_2, dg.E_injected, dg.E_injected_1, dg.E_injected_2,
-                  dg.U_L1, dg.U_L2, dg.U_L3, dg.I_L1, dg.I_L2, dg.I_L3
-                  ); cli_client.write(st);
       
+      dg.I_Mod_L1 = cfg.I_Max_meter*100 - cfg.I_Max_station*100;  if (dg.I_Mod_L1 < dg.I_L1) dg.I_Mod_L1 = dg.I_L1;
+      dg.I_Mod_L2 = cfg.I_Max_meter*100 - cfg.I_Max_station*100;  if (dg.I_Mod_L2 < dg.I_L2) dg.I_Mod_L2 = dg.I_L2;
+      dg.I_Mod_L3 = cfg.I_Max_meter*100 - cfg.I_Max_station*100;  if (dg.I_Mod_L3 < dg.I_L3) dg.I_Mod_L3 = dg.I_L3;
+      
+      //dg.P_Mod_act_L1 = dg.U_L1 * dg.I_L1 / 1000;
+      //dg.P_Mod_act_L2 = dg.U_L2 * dg.I_L2 / 1000;
+      //dg.P_Mod_act_L3 = dg.U_L3 * dg.I_L3 / 1000;
+
+      p1_copytoorig(&dg);
+      p1_copytomod(&dg);
+      dg_obis_update("1-0:31.7.0(", "*A)", dg.I_Mod_L1, 3, 2);
+      dg_obis_update("1-0:51.7.0(", "*A)", dg.I_Mod_L2, 3, 2);
+      dg_obis_update("1-0:71.7.0(", "*A)", dg.I_Mod_L3, 3, 2);
+      crc_add(dg.ModP1);
+
+      char st[200];
+      
+      if (cli_dspEnergy) {
+        sprintf(st, "\n\rE_Cons:%9i (%i + %i)\n\rE_Inj :%9i (%i + %i)",
+                    dg.E_consumed, dg.E_consumed_1, dg.E_consumed_2, dg.E_injected, dg.E_injected_1, dg.E_injected_2
+                    ); cli_client.write(st);
+        cli_dspEnergy = false;
+      }
+
+      if (cli_dspPower) {
+        sprintf(st, "\n\rP_Cons:%7i\n\rP_Inj :%7i\n\rU     : %3i %3i %3i\n\rI      : %3i %3i %3i",
+                    dg.P_consumed, dg.P_injected,
+                    dg.U_L1, dg.U_L2, dg.U_L3, dg.I_L1, dg.I_L2, dg.I_L3
+                    ); cli_client.write(st);
+        cli_dspPower = false;
+      }
+
+      if (cli_dspPeak) {
+        sprintf(st, "\r\nDate:%06i\r\nTime:%06i\r\nQuarterTime:%03i\r\nCurrent Peak Pwr :%7i\r\nLast Peak Pwr: %7i",
+                    dg.CurrentDate, dg.CurrentTime, dg.QuarterTime,
+                    dg.CurrentPeak, dg.LastPeak
+                    ); cli_client.write(st);
+        cli_dspPeak = false;
+      }
+
+      if (cli_dspOrigP1) {
+        cli_client.write(dg.OrigP1);
+        cli_dspOrigP1 = false;
+      }
+
+      if (cli_dspModP1) {
+        cli_client.write(dg.ModP1);
+        cli_dspModP1 = false;
+      }
+
+      if (p1_connected) {
+        if (p1_client.connected()) p1_client.write(dg.OrigP1);
+      }
+
+      if (pm1_connected) {
+        if (pm1_client.connected()) pm1_client.write(dg.ModP1);
+      }
+
+      if (p1_serial_out) {
+        Serial.write(dg.ModP1);
+      }
+
       dg.received = false;
       dg.decoded = true;
     }
     break;
+
   case 4:  // Process MQTT
     process_mqtt();
     break;
-
+ 
   default: // Loop state machine
     loopidx = 0;
     break;
