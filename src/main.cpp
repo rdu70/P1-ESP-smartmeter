@@ -1,3 +1,9 @@
+// ESPP1 - P1 DSMR ESP32
+// Author  : Romuald Dufour
+// License : GPL v3
+// Release : 2024.05
+
+
 #if !defined(ESP8266)
   #error This code is designed to run on ESP8266 and ESP8266-based boards!
 #endif
@@ -13,34 +19,39 @@
 #include <PubSubClient.h>
 #include <ota.h>
 
-// Include specific hardware libs
-// #include <ELECHOUSE_CC1101_SRC_DRV.h>
-
 // Include project specific headers
 #include "cred.h"
 
-// Timer
-Ticker Timer1;
+
+// Hardware I/O
+int rx_pin = D2;  // D2
+int tx_pin = D1;  // D1
+int rx_led = D3;  // D3
+//int tx_led = D4;
+
+// Network vars
+bool wifi_connected = false;
+bool mqtt_connected = false;
+bool p1_connected = false;
+bool pm1_connected = false;
+
 WiFiClient espClient;
 PubSubClient mqtt_client(espClient);
-WiFiClient cli_client;
-WiFiServer cli_server(23);
-
 WiFiClient p1_client;
 WiFiServer p1_server(101);
 WiFiClient pm1_client;
 WiFiServer pm1_server(102);
 
+#define MQTT_ON 1
 #define MQTT_TOPIC "home/smartmeter/"
 #define MQTT_TOPIC_SUB "home/smartmeter/cmd/#"
 #define MQTT_LWT "home/smartmeter/availability"
 
-// Hardware I/O
-int rx_pin = D2;  // D2
-int tx_pin = D1;  // D1
-int rx_led = D3;
-int tx_led = D4;
-
+// netcli vars
+bool netcli_connected = false;
+bool netcli_disconnect = false;
+WiFiClient cli_client;
+WiFiServer cli_server(23);
 
 // cli vars
 std::string line = "";
@@ -51,30 +62,25 @@ bool cli_dspEnergy = false;
 bool cli_dspPower = false;
 bool cli_dspPeak = false;
 
-// netcli vars
-bool netcli_connected = false;
-bool netcli_disconnect = false;
 
-// Network vars
-bool wifi_connected = false;
-bool mqtt_connected = false;
-bool p1_connected = false;
-bool pm1_connected = false;
-uint8_t eeprom_to_save = 0;
-uint8_t cmd_clear = 255;
-
-
+// Configuration vars
 struct CFG {
   uint32_t I_Max_meter = 32;
-  uint32_t I_Max_station = 32;
-  //bool Show_Orig_P1 = false;
-  //bool Show_Mod_P1 = false;
+  uint32_t I_Shift = 0;
+  bool send_p1 = true;
+  bool send_pm1 = true;
+  bool send_serial = true;
   //bool Show_Stats = false;
 };
 
 CFG cfg;
 CFG cfg_old;
 
+uint8_t eeprom_to_save = 0;
+uint8_t cmd_clear = 255;
+
+
+// P1 data
 struct DG {
   bool received = false;
   bool decoded = false;
@@ -129,7 +135,9 @@ struct DG {
 DG dg;
 DG dg_old;
 
+
 // Other vars
+Ticker Timer1;
 unsigned long currentmillis = millis();
 unsigned long lastmillis = currentmillis;
 uint32_t uptime = 0;
@@ -137,7 +145,6 @@ uint8_t loopidx = 0;
 int safecnt = 20;  // Time before start to allow OTA
 char uptime_txt[48];
 char dttime_txt[48];
-bool p1_serial_out = false;
 
 
 
@@ -168,12 +175,12 @@ std::string trim(const std::string& str,
 
 void check_cfg() {
   if ((cfg.I_Max_meter < 0) || (cfg.I_Max_meter > 32)) cfg.I_Max_meter = 32;
-  if ((cfg.I_Max_station < 0) || (cfg.I_Max_station > 32)) cfg.I_Max_station = 32;
+  if ((cfg.I_Shift < 0) || (cfg.I_Shift > 32)) cfg.I_Shift = 32;
 }
 
 void print_cfg() {
   cli_print(String("Meter max current    : ") + cfg.I_Max_meter, true, false, true);
-  cli_print(String("Station max current  : ") + cfg.I_Max_station, true, false, true);
+  cli_print(String("Station shift current  : ") + cfg.I_Shift, true, false, true);
 }
 
 void data_save() {
@@ -263,8 +270,17 @@ void exec_cmd(bool ser = false, bool net = false) {
   }
   if (cmd == "save") data_save();
   if (cmd == "load") data_load();
-  if (cmd == "serialon") p1_serial_out = true;
-  if (cmd == "serialoff") p1_serial_out = false;
+  
+  if (cmd == "setshift") {
+    if ((p1 >= 0) && (p1 <= 32)) cfg.I_Shift = p1;
+  }
+
+  if (cmd == "serialon") cfg.send_serial = true;
+  if (cmd == "serialoff") cfg.send_serial = false;
+  if (cmd == "p1on") cfg.send_p1 = true;
+  if (cmd == "p1off") cfg.send_p1 = false;
+  if (cmd == "pm1on") cfg.send_pm1 = true;
+  if (cmd == "pm1off") cfg.send_pm1 = false;
 }
 
 void process_cli(bool ser=false, bool net=false) {
@@ -421,7 +437,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     int amp = 0;
     try { amp = std::stoi((char *)payload, nullptr, 0); } catch(...) {}
     dbgdsp += " - Set MAX amp to " + std::to_string(amp) + " A";
-    cfg.I_Max_station = amp;
+    cfg.I_Shift = amp;
   }
 }
 
@@ -558,8 +574,8 @@ void setup() {
   // LED
   pinMode(rx_led, OUTPUT);
   digitalWrite(rx_led, HIGH);
-  pinMode(tx_led, OUTPUT);
-  digitalWrite(tx_led, HIGH);
+  //pinMode(tx_led, OUTPUT);
+  //digitalWrite(tx_led, HIGH);
 
   // Start WiFi
   WiFi.mode(WIFI_STA);
@@ -605,18 +621,20 @@ void loop() {
       }
     }
     else {
-      if (!mqtt_connected){
-        if (mqtt_client.connect("ESP8266-P1", MQTT_USER, MQTT_PASS, MQTT_LWT, 1, true, "offline")) {
-          mqtt_connected = true;
-          dbgdsp = "MQTT connected";
-          mqtt_client.publish(MQTT_LWT, "online", true);
-          mqtt_client.subscribe(MQTT_TOPIC_SUB);
-        } else {
-          dbgdsp = "MQTT client connection failed";
+      if (MQTT_ON != 0) {
+        if (!mqtt_connected){
+          if (mqtt_client.connect("ESP8266-P1", MQTT_USER, MQTT_PASS, MQTT_LWT, 1, true, "offline")) {
+            mqtt_connected = true;
+            dbgdsp = "MQTT connected";
+            mqtt_client.publish(MQTT_LWT, "online", true);
+            mqtt_client.subscribe(MQTT_TOPIC_SUB);
+          } else {
+            dbgdsp = "MQTT client connection failed";
+          }
+        } else if (! mqtt_client.connected()) {
+          mqtt_connected = false;
+          dbgdsp = "MQTT client disconnected";
         }
-      } else if (! mqtt_client.connected()) {
-        mqtt_connected = false;
-        dbgdsp = "MQTT client disconnected";
       }
 
       if (WiFi.status() != WL_CONNECTED) {
@@ -775,9 +793,9 @@ void loop() {
       dg.P_cos_L2 = (dg.P_act_L2 != 0 ? (100 * dg.P_ap_L2 / dg.P_act_L2) : 1);
       dg.P_cos_L3 = (dg.P_act_L3 != 0 ? (100 * dg.P_ap_L3 / dg.P_act_L3) : 1);
       
-      dg.I_Mod_L1 = cfg.I_Max_meter*100 - cfg.I_Max_station*100;  if (dg.I_Mod_L1 < dg.I_L1) dg.I_Mod_L1 = dg.I_L1;
-      dg.I_Mod_L2 = cfg.I_Max_meter*100 - cfg.I_Max_station*100;  if (dg.I_Mod_L2 < dg.I_L2) dg.I_Mod_L2 = dg.I_L2;
-      dg.I_Mod_L3 = cfg.I_Max_meter*100 - cfg.I_Max_station*100;  if (dg.I_Mod_L3 < dg.I_L3) dg.I_Mod_L3 = dg.I_L3;
+    //  dg.I_Mod_L1 = dg.I_L1 + cfg.I_Shift*100;  if (dg.I_Mod_L1 > cfg.I_Max_meter*100) dg.I_Mod_L1 = cfg.I_Max_meter*100;
+    //  dg.I_Mod_L2 = dg.I_L2 + cfg.I_Shift*100;  if (dg.I_Mod_L2 > cfg.I_Max_meter*100) dg.I_Mod_L2 = cfg.I_Max_meter*100;
+    //  dg.I_Mod_L3 = dg.I_L3 + cfg.I_Shift*100;  if (dg.I_Mod_L3 > cfg.I_Max_meter*100) dg.I_Mod_L3 = cfg.I_Max_meter*100;
       
       //dg.P_Mod_act_L1 = dg.U_L1 * dg.I_L1 / 1000;
       //dg.P_Mod_act_L2 = dg.U_L2 * dg.I_L2 / 1000;
@@ -785,9 +803,9 @@ void loop() {
 
       p1_copytoorig(&dg);
       p1_copytomod(&dg);
-      dg_obis_update("1-0:31.7.0(", "*A)", dg.I_Mod_L1, 3, 2);
-      dg_obis_update("1-0:51.7.0(", "*A)", dg.I_Mod_L2, 3, 2);
-      dg_obis_update("1-0:71.7.0(", "*A)", dg.I_Mod_L3, 3, 2);
+    //  dg_obis_update("1-0:31.7.0(", "*A)", dg.I_Mod_L1, 3, 2);
+    //  dg_obis_update("1-0:51.7.0(", "*A)", dg.I_Mod_L2, 3, 2);
+    //  dg_obis_update("1-0:71.7.0(", "*A)", dg.I_Mod_L3, 3, 2);
       crc_add(dg.ModP1);
 
       char st[200];
@@ -826,14 +844,14 @@ void loop() {
       }
 
       if (p1_connected) {
-        if (p1_client.connected()) p1_client.write(dg.OrigP1);
+        if (p1_client.connected() && cfg.send_p1) p1_client.write(dg.OrigP1);
       }
 
       if (pm1_connected) {
-        if (pm1_client.connected()) pm1_client.write(dg.ModP1);
+        if (pm1_client.connected() && cfg.send_pm1) pm1_client.write(dg.ModP1);
       }
 
-      if (p1_serial_out) {
+      if (cfg.send_serial) {
         Serial.write(dg.ModP1);
       }
 
